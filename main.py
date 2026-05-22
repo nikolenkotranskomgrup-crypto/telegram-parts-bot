@@ -1,6 +1,7 @@
 import os
 import asyncio
 import tempfile
+import sqlite3
 import re
 import json
 import html
@@ -151,6 +152,7 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [KeyboardButton("♻️ Снятая запчасть / возврат")],
         [KeyboardButton("🔎 Найти заявку"), KeyboardButton("📋 Мои заявки")],
         [KeyboardButton("💾 Резервная копия")],
+        [KeyboardButton("🗂 Восстановить историю")],
     ],
     resize_keyboard=True,
 )
@@ -550,7 +552,7 @@ def order_keyboard(order_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔵 Сборка на складе", callback_data=f"order_status:{order_id}:assembly")],
         [InlineKeyboardButton("🟣 Запущен тендер", callback_data=f"order_status:{order_id}:tender")],
         [InlineKeyboardButton("🟠 Отправка от поставщика", callback_data=f"order_status:{order_id}:supplier_shipping")],
-        [InlineKeyboardButton("📦 Внести ТТН", callback_data=f"order_ttn:{order_id}")],
+        [InlineKeyboardButton("📦 Внести ТТН / данные отправки", callback_data=f"order_ttn:{order_id}")],
         [InlineKeyboardButton("❌ Отмена", callback_data=f"order_status:{order_id}:cancelled")],
     ])
 
@@ -700,7 +702,7 @@ def order_card(order_id: int) -> str:
         f"👤 Заказчик: {order['user_name']}\n"
         f"📅 Дата: {order['created_at']}\n\n"
         f"🟡 Статус: {order['status']}"
-        + (f"\n📦 ТТН НП: {order['ttn']}" if order['ttn'] else "")
+        + (f"\n📦 ТТН / данные отправки: {order['ttn']}" if order['ttn'] else "")
     )
 
 
@@ -741,8 +743,8 @@ def full_ttn_notification(order_id: int) -> str:
         f"📦 Запчасти:\n{fmt_items(items)}\n\n"
         f"📍 Контрагент: {order['destination_title']}\n\n"
         f"🚚 Контакты и условия доставки:\n{order['delivery_details'] or '—'}\n\n"
-        f"🚚 Служба доставки: Новая Почта\n"
-        f"📦 ТТН: {order['ttn']}\n\n"
+        f""
+        f"📦 ТТН / данные отправки: {order['ttn']}\n\n"
         f"Статус: {order['status']}"
     )
 
@@ -929,6 +931,148 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Ваш Telegram ID: {update.effective_user.id}", reply_markup=MAIN_MENU)
 
 
+# =========================
+# RESTORE OLD SQLITE BACKUPS
+# =========================
+
+RESTORE_TABLES = {
+    "users": "user_id",
+    "orders": "id",
+    "order_items": "id",
+    "returns": "id",
+    "return_items": "id",
+    "actions_log": "id",
+    "pending_group_actions": "id",
+}
+
+
+def sqlite_table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    return bool(row)
+
+
+def restore_sqlite_backup_to_supabase(sqlite_path: str) -> Dict[str, int]:
+    """
+    Переносит старую SQLite-резервную копию .db в Supabase/PostgreSQL.
+    Данные добавляются/обновляются по первичному ключу, чтобы не стирать текущую историю.
+    """
+    init_db()
+
+    counts: Dict[str, int] = {}
+    src = sqlite3.connect(sqlite_path)
+    src.row_factory = sqlite3.Row
+
+    try:
+        with get_db() as dst:
+            for table, pk in RESTORE_TABLES.items():
+                if not sqlite_table_exists(src, table):
+                    counts[table] = 0
+                    continue
+
+                rows = src.execute(f"SELECT * FROM {table}").fetchall()
+                counts[table] = len(rows)
+
+                for row in rows:
+                    data = dict(row)
+                    if not data:
+                        continue
+
+                    cols = list(data.keys())
+                    placeholders = ", ".join(["%s"] * len(cols))
+                    col_sql = ", ".join(cols)
+
+                    update_cols = [c for c in cols if c != pk]
+                    if update_cols:
+                        update_sql = ", ".join([f"{c}=EXCLUDED.{c}" for c in update_cols])
+                        conflict_sql = f"ON CONFLICT ({pk}) DO UPDATE SET {update_sql}"
+                    else:
+                        conflict_sql = f"ON CONFLICT ({pk}) DO NOTHING"
+
+                    sql = f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders}) {conflict_sql}"
+                    dst.execute(sql, tuple(data[c] for c in cols))
+
+            # Обновляем serial-последовательности, чтобы новые записи не конфликтовали со старыми id.
+            for table in ["orders", "order_items", "returns", "return_items", "actions_log", "pending_group_actions"]:
+                dst.execute(
+                    f"""
+                    SELECT setval(
+                        pg_get_serial_sequence('{table}', 'id'),
+                        COALESCE((SELECT MAX(id) FROM {table}), 1),
+                        true
+                    )
+                    """
+                )
+            dst.commit()
+    finally:
+        src.close()
+
+    return counts
+
+
+async def start_restore_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Восстановление доступно только администратору.", reply_markup=MAIN_MENU)
+        return
+
+    set_state(update.effective_user.id, "waiting_restore_file", {}, user_name_from_update(update))
+    await update.message.reply_text(
+        "🗂 Отправьте файл старой резервной копии `.db` одним документом.\\n\\n"
+        "Пример файла: `bot_backup_2026-05-22_08-46-34.db`",
+        reply_markup=MAIN_MENU,
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await start_restore_flow(update, context)
+
+
+async def handle_restore_document(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, user_name: str) -> bool:
+    if not update.message or not update.message.document:
+        return False
+
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ Восстановление доступно только администратору.", reply_markup=MAIN_MENU)
+        return True
+
+    document = update.message.document
+    filename = document.file_name or "backup.db"
+
+    if not filename.lower().endswith(".db"):
+        await update.message.reply_text("❌ Нужен именно файл `.db`.", reply_markup=MAIN_MENU, parse_mode="Markdown")
+        return True
+
+    temp_path = os.path.join(tempfile.gettempdir(), f"restore_{user_id}_{filename}")
+
+    try:
+        tg_file = await context.bot.get_file(document.file_id)
+        await tg_file.download_to_drive(temp_path)
+
+        counts = restore_sqlite_backup_to_supabase(temp_path)
+        set_state(user_id, None, user_name=user_name)
+
+        lines = ["✅ Восстановление истории завершено.", "", "Перенесено:"]
+        for table, count in counts.items():
+            lines.append(f"{table}: {count}")
+
+        await update.message.reply_text("\\n".join(lines), reply_markup=MAIN_MENU)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка восстановления: {e}", reply_markup=MAIN_MENU)
+    finally:
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+
+    return True
+
+
 async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user or not update.effective_chat:
         return
@@ -985,6 +1129,7 @@ async def text_or_photo_handler(update: Update, context: ContextTypes.DEFAULT_TY
     user_name = user_name_from_update(update)
     text = update.message.text or update.message.caption or ""
     photo_file_id = update.message.photo[-1].file_id if update.message.photo else None
+    document = update.message.document
 
     # Pending TTN from group
     if chat and chat.type in ("group", "supergroup"):
@@ -1019,7 +1164,7 @@ async def text_or_photo_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     if text == "🔎 Найти заявку":
         set_state(user_id, "waiting_search", {}, user_name)
-        await update.message.reply_text("Введите госномер, код запчасти, номер заявки, наименование или ТТН:", reply_markup=MAIN_MENU)
+        await update.message.reply_text("Введите госномер, код запчасти, номер заявки, наименование, ТТН или данные отправки / данные отправки:", reply_markup=MAIN_MENU)
         return
 
     if text == "📋 Мои заявки":
@@ -1030,7 +1175,18 @@ async def text_or_photo_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await send_backup_to_admin(update, context)
         return
 
+    if text == "🗂 Восстановить историю":
+        await start_restore_flow(update, context)
+        return
+
     state, data = get_state(user_id)
+
+    if state == "waiting_restore_file":
+        if document:
+            await handle_restore_document(update, context, user_id, user_name)
+            return
+        await update.message.reply_text("Отправьте файл резервной копии `.db` документом.", reply_markup=MAIN_MENU, parse_mode="Markdown")
+        return
 
     if state == "waiting_unknown_decision":
         unknown_id = int(data["unknown_id"])
@@ -1232,10 +1388,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         with get_db() as conn:
             conn.execute(
                 "INSERT INTO pending_group_actions(user_id,chat_id,action,entity_type,entity_id,created_at) VALUES(?,?,?,?,?,?)",
-                (user_id, query.message.chat_id, "awaiting_ttn", "order", order_id, now()),
+                (user_id, query.message.chat_id, "awaiting_shipping", "order", order_id, now()),
             )
             conn.commit()
-        await query.message.reply_text(f"Введите номер ТТН Новой Почты для заявки №{order['order_number']}:")
+        log_action("order", order_id, "Ожидаются ТТН / данные отправки", order["status"], order["status"], user_id, user_name)
+        await query.message.reply_text(
+            f"Введите ТТН / данные отправки для заявки №{order['order_number']}.\n\n"
+            "Можно отправить не только номер НП, но и любые данные отправки: поставщик, контакт, телефон, адрес, комментарий.\n"
+            "Данные может отправить любой участник этой группы."
+        )
         return
 
     if data.startswith("return_all:"):
@@ -1317,8 +1478,12 @@ async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     with get_db() as conn:
         pending = conn.execute(
-            "SELECT * FROM pending_group_actions WHERE user_id=? AND chat_id=? ORDER BY id DESC LIMIT 1",
-            (user_id, chat_id),
+            """
+            SELECT * FROM pending_group_actions
+            WHERE chat_id=? AND action IN ('awaiting_shipping', 'awaiting_ttn')
+            ORDER BY id DESC LIMIT 1
+            """,
+            (chat_id,),
         ).fetchone()
     state, state_data = get_state(user_id)
 
@@ -1351,17 +1516,17 @@ async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if not pending:
         return
 
-    if pending["action"] == "awaiting_ttn" and pending["entity_type"] == "order":
+    if pending["action"] in ("awaiting_shipping", "awaiting_ttn") and pending["entity_type"] == "order":
         order_id = int(pending["entity_id"])
-        ttn = text.strip()
+        shipping_data = text.strip()
         order = get_order(order_id)
         old_status = order["status"]
         new_status = ORDER_STATUSES["sent_supplier"] if old_status == ORDER_STATUSES["supplier_shipping"] else ORDER_STATUSES["sent_warehouse"]
         with get_db() as conn:
-            conn.execute("UPDATE orders SET ttn=?, status=?, updated_at=? WHERE id=?", (ttn, new_status, now(), order_id))
+            conn.execute("UPDATE orders SET ttn=?, status=?, updated_at=? WHERE id=?", (shipping_data, new_status, now(), order_id))
             conn.execute("DELETE FROM pending_group_actions WHERE id=?", (pending["id"],))
             conn.commit()
-        log_action("order", order_id, f"Внесена ТТН {ttn}", old_status, new_status, user_id, user_name)
+        log_action("order", order_id, f"Внесены ТТН / данные отправки: {shipping_data}", old_status, new_status, user_id, user_name)
         updated_order = get_order(order_id)
         try:
             await context.bot.edit_message_text(
@@ -1376,7 +1541,7 @@ async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             await context.bot.send_message(chat_id=updated_order["user_id"], text=full_ttn_notification(order_id))
         except Exception:
             pass
-        await update.message.reply_text(f"✅ ТТН сохранена. Статус: {new_status}")
+        await update.message.reply_text(f"✅ ТТН / данные отправки сохранены. Статус: {new_status}")
 
 
 async def update_order_status(context: ContextTypes.DEFAULT_TYPE, order_id: int, status_key: str, user_id: int, user_name: str) -> None:
@@ -1514,7 +1679,7 @@ async def search_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, q
     if orders:
         parts.append("📦 Заявки на запчасти:")
         for o in orders:
-            parts.append(f"№{o['order_number']} | {o['vehicle_plate']} | {o['status']} | ТТН: {o['ttn'] or '—'}")
+            parts.append(f"№{o['order_number']} | {o['vehicle_plate']} | {o['status']} | ТТН / данные отправки: {o['ttn'] or '—'}")
     if returns:
         parts.append("\n♻️ Возвраты б/у:")
         for r in returns:
@@ -1633,7 +1798,7 @@ def web_page(q: str = "", status: str = "") -> str:
     </form>
 
     <h2>📦 Заявки на новые запчасти</h2>
-    <table><thead><tr><th>Дата</th><th>№</th><th>Госномер</th><th>Модель</th><th>Запчасти</th><th>Контрагент</th><th>Доставка/контакты</th><th>Статус</th><th>ТТН</th></tr></thead>
+    <table><thead><tr><th>Дата</th><th>№</th><th>Госномер</th><th>Модель</th><th>Запчасти</th><th>Контрагент</th><th>Доставка/контакты</th><th>Статус</th><th>ТТН / данные отправки</th></tr></thead>
     <tbody>{''.join(order_rows) or '<tr><td colspan="9">Нет данных</td></tr>'}</tbody></table>
 
     <h2>♻️ Возвраты б/у запчастей</h2>
@@ -1653,10 +1818,11 @@ def web_page(q: str = "", status: str = "") -> str:
 telegram_app = Application.builder().token(BOT_TOKEN).build()
 telegram_app.add_handler(CommandHandler("start", cmd_start))
 telegram_app.add_handler(CommandHandler("backup", cmd_backup))
+telegram_app.add_handler(CommandHandler("restore", cmd_restore))
 telegram_app.add_handler(CommandHandler("id", cmd_id))
 telegram_app.add_handler(CommandHandler("unknown", cmd_unknown))
 telegram_app.add_handler(CallbackQueryHandler(callback_handler))
-telegram_app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, text_or_photo_handler))
+telegram_app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, text_or_photo_handler))
 
 app = FastAPI()
 daily_backup_task = None
