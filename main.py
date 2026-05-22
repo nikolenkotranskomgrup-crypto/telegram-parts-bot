@@ -1,8 +1,11 @@
 import os
+import asyncio
+import tempfile
 import re
 import json
 import html
-import sqlite3
+import psycopg
+from psycopg.rows import dict_row
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,9 +34,12 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PARTS_GROUP_ID = int(os.getenv("PARTS_GROUP_ID", "0"))
 RETURNS_GROUP_ID = int(os.getenv("RETURNS_GROUP_ID", "0"))
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
-DB_PATH = os.getenv("DB_PATH", "bot.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ANDREY_ID = int(os.getenv("ANDREY_ID", "0"))
+AUTO_DAILY_BACKUP = os.getenv("AUTO_DAILY_BACKUP", "true").lower() in ("1", "true", "yes", "on")
+DAILY_BACKUP_HOUR = int(os.getenv("DAILY_BACKUP_HOUR", "6"))
 PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN:
@@ -44,6 +50,8 @@ if not PARTS_GROUP_ID:
     raise RuntimeError("PARTS_GROUP_ID is not set")
 if not RETURNS_GROUP_ID:
     raise RuntimeError("RETURNS_GROUP_ID is not set")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
 
 DESTINATIONS: Dict[str, Dict[str, str]] = {
     "dest_1": {
@@ -122,6 +130,21 @@ RETURN_STATUSES = {
     "not_arrived": "Не приехала",
 }
 
+UNKNOWN_STATUSES = {
+    "waiting_andrey": "Ожидает решения Андрея",
+    "resolved": "Решение получено",
+}
+
+ALLOWED_UNKNOWN_RECOMMENDATIONS = {
+    "в утиль": "В утиль",
+    "утиль": "В утиль",
+    "на восстановление": "На восстановление",
+    "восстановление": "На восстановление",
+    "на б/у склад": "На б/у склад",
+    "б/у склад": "На б/у склад",
+    "бу склад": "На б/у склад",
+}
+
 MAIN_MENU = ReplyKeyboardMarkup(
     [
         [KeyboardButton("➕ Новая заявка на запчасти")],
@@ -132,14 +155,88 @@ MAIN_MENU = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+BU_GROUP_MENU = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("⚠️ Неопознанная б/у запчасть")],
+    ],
+    resize_keyboard=True,
+)
+
 # =========================
 # DATABASE
 # =========================
 
-def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def convert_placeholders(sql: str) -> str:
+    return sql.replace("?", "%s")
+
+
+class PgCursor:
+    def __init__(self, conn: "PgConnection"):
+        self.conn = conn
+        self.cur = conn.raw.cursor()
+        self.lastrowid = None
+
+    def execute(self, sql: str, params: tuple = ()):
+        query = convert_placeholders(sql.strip())
+        lowered = query.lower()
+
+        needs_returning_id = (
+            lowered.startswith("insert into orders(")
+            or lowered.startswith("insert into returns(")
+            or lowered.startswith("insert into unknown_returns(")
+        ) and "returning id" not in lowered
+
+        if needs_returning_id:
+            query = query.rstrip(";") + " RETURNING id"
+
+        self.cur.execute(query, params)
+
+        if needs_returning_id:
+            row = self.cur.fetchone()
+            self.lastrowid = row["id"] if row else None
+
+        return self
+
+    def fetchone(self):
+        return self.cur.fetchone()
+
+    def fetchall(self):
+        return self.cur.fetchall()
+
+
+class PgConnection:
+    def __init__(self):
+        self.raw = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type:
+            self.raw.rollback()
+        else:
+            self.raw.commit()
+        self.raw.close()
+
+    def cursor(self) -> PgCursor:
+        return PgCursor(self)
+
+    def execute(self, sql: str, params: tuple = ()):
+        cur = self.cursor()
+        return cur.execute(sql, params)
+
+    def executescript(self, script: str):
+        statements = [stmt.strip() for stmt in script.split(";") if stmt.strip()]
+        with self.raw.cursor() as cur:
+            for stmt in statements:
+                cur.execute(stmt)
+
+    def commit(self):
+        self.raw.commit()
+
+
+def get_db() -> PgConnection:
+    return PgConnection()
 
 
 def now() -> str:
@@ -151,7 +248,7 @@ def init_db() -> None:
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
+                user_id BIGINT PRIMARY KEY,
                 user_name TEXT,
                 state TEXT,
                 state_data TEXT,
@@ -159,9 +256,9 @@ def init_db() -> None:
             );
 
             CREATE TABLE IF NOT EXISTS orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 order_number TEXT UNIQUE,
-                user_id INTEGER,
+                user_id BIGINT,
                 user_name TEXT,
                 vehicle_plate TEXT,
                 vehicle_model TEXT,
@@ -172,13 +269,13 @@ def init_db() -> None:
                 status TEXT,
                 ttn TEXT,
                 photo_file_id TEXT,
-                group_message_id INTEGER,
+                group_message_id BIGINT,
                 created_at TEXT,
                 updated_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS order_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 order_id INTEGER,
                 part_code TEXT,
                 part_name TEXT,
@@ -186,49 +283,74 @@ def init_db() -> None:
             );
 
             CREATE TABLE IF NOT EXISTS returns (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 return_number TEXT UNIQUE,
                 linked_order_id INTEGER,
-                user_id INTEGER,
+                user_id BIGINT,
                 user_name TEXT,
                 vehicle_plate TEXT,
                 vehicle_model TEXT,
                 delivery_comment TEXT,
                 status TEXT,
                 photo_file_id TEXT,
-                group_message_id INTEGER,
+                group_message_id BIGINT,
                 created_at TEXT,
                 updated_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS return_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 return_id INTEGER,
                 part_code TEXT,
                 part_name TEXT,
                 quantity TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS unknown_returns (
+                id SERIAL PRIMARY KEY,
+                unknown_number TEXT UNIQUE,
+                created_by_user_id BIGINT,
+                created_by_user_name TEXT,
+                part_code TEXT,
+                part_name TEXT,
+                quantity TEXT,
+                warehouse_comment TEXT,
+                status TEXT,
+                photo_file_id TEXT,
+                group_message_id BIGINT,
+                andrey_message_id BIGINT,
+                vehicle_plate TEXT,
+                recommendation TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS actions_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 entity_type TEXT,
                 entity_id INTEGER,
                 action TEXT,
                 old_status TEXT,
                 new_status TEXT,
-                user_id INTEGER,
+                user_id BIGINT,
                 user_name TEXT,
                 created_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS pending_group_actions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                chat_id INTEGER,
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                chat_id BIGINT,
                 action TEXT,
                 entity_type TEXT,
                 entity_id INTEGER,
                 created_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TEXT
             );
             """
         )
@@ -248,7 +370,16 @@ def user_name_from_update(update: Update) -> str:
 def set_state(user_id: int, state: Optional[str], data: Optional[dict] = None, user_name: str = "") -> None:
     with get_db() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO users(user_id,user_name,state,state_data,updated_at) VALUES(?,?,?,?,?)",
+            """
+            INSERT INTO users(user_id,user_name,state,state_data,updated_at)
+            VALUES(%s,%s,%s,%s,%s)
+            ON CONFLICT (user_id)
+            DO UPDATE SET
+                user_name=EXCLUDED.user_name,
+                state=EXCLUDED.state,
+                state_data=EXCLUDED.state_data,
+                updated_at=EXCLUDED.updated_at
+            """,
             (user_id, user_name, state, json.dumps(data or {}, ensure_ascii=False), now()),
         )
         conn.commit()
@@ -267,6 +398,8 @@ def get_state(user_id: int) -> Tuple[Optional[str], dict]:
 
 
 def next_number(table: str, prefix: str) -> str:
+    if table not in {"orders", "returns", "unknown_returns"}:
+        raise ValueError("Invalid table")
     with get_db() as conn:
         row = conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()
     return f"{prefix}{int(row['c']) + 1:06d}"
@@ -278,6 +411,26 @@ def log_action(entity_type: str, entity_id: int, action: str, old_status: str, n
             """INSERT INTO actions_log(entity_type,entity_id,action,old_status,new_status,user_id,user_name,created_at)
                VALUES(?,?,?,?,?,?,?,?)""",
             (entity_type, entity_id, action, old_status, new_status, user_id, user_name, now()),
+        )
+        conn.commit()
+
+
+def get_setting(key: str, default: str = "") -> str:
+    with get_db() as conn:
+        row = conn.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO app_settings(key,value,updated_at)
+            VALUES(%s,%s,%s)
+            ON CONFLICT (key)
+            DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at
+            """,
+            (key, value, now()),
         )
         conn.commit()
 
@@ -350,6 +503,32 @@ def parse_specific_return_lines(text: str) -> List[dict]:
         raise ValueError("Не удалось распознать запчасть. Пример: 789456 — Стартер — привезет водитель")
     return items
 
+
+def parse_unknown_return_text(text: str) -> Tuple[str, str, str, str]:
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    if lines and lines[0].lower().replace("ё", "е") in {"бу", "б/у", "+бу", "неопознанная", "неопознанная бу"}:
+        lines = lines[1:]
+    if len(lines) < 3:
+        raise ValueError("Нужно 3 строки: артикул, название, количество.")
+    part_code = lines[0]
+    part_name = lines[1]
+    quantity = lines[2]
+    warehouse_comment = "\n".join(lines[3:]).strip()
+    return part_code, part_name, quantity, warehouse_comment
+
+
+def parse_andrey_unknown_decision(text: str) -> Tuple[str, str]:
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    if len(lines) < 2:
+        raise ValueError("Нужно 2 строки: госномер авто и рекомендация.")
+    plate = lines[0].upper()
+    # Рекомендация свободная: Андрей может написать как угодно.
+    # Примеры: В утиль / На восстановление / На б/у склад.
+    recommendation = " ".join(lines[1:]).strip()
+    if not recommendation:
+        raise ValueError("Укажите рекомендацию второй строкой.")
+    return plate, recommendation
+
 # =========================
 # KEYBOARDS
 # =========================
@@ -417,7 +596,7 @@ def create_order(user_id: int, user_name: str, plate: str, model: str, items: Li
     return order_id
 
 
-def get_order(order_id: int) -> sqlite3.Row:
+def get_order(order_id: int) -> dict:
     with get_db() as conn:
         row = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
     if not row:
@@ -425,7 +604,7 @@ def get_order(order_id: int) -> sqlite3.Row:
     return row
 
 
-def get_order_items(order_id: int) -> List[sqlite3.Row]:
+def get_order_items(order_id: int) -> List[dict]:
     with get_db() as conn:
         return conn.execute("SELECT * FROM order_items WHERE order_id=? ORDER BY id", (order_id,)).fetchall()
 
@@ -450,7 +629,7 @@ def create_return(user_id: int, user_name: str, plate: str, model: str, items: L
     return return_id
 
 
-def get_return(return_id: int) -> sqlite3.Row:
+def get_return(return_id: int) -> dict:
     with get_db() as conn:
         row = conn.execute("SELECT * FROM returns WHERE id=?", (return_id,)).fetchone()
     if not row:
@@ -458,15 +637,38 @@ def get_return(return_id: int) -> sqlite3.Row:
     return row
 
 
-def get_return_items(return_id: int) -> List[sqlite3.Row]:
+def get_return_items(return_id: int) -> List[dict]:
     with get_db() as conn:
         return conn.execute("SELECT * FROM return_items WHERE return_id=? ORDER BY id", (return_id,)).fetchall()
+
+
+def create_unknown_return(user_id: int, user_name: str, part_code: str, part_name: str, quantity: str, warehouse_comment: str, photo_file_id: Optional[str]) -> int:
+    unknown_number = next_number("unknown_returns", "UNK-")
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO unknown_returns(unknown_number,created_by_user_id,created_by_user_name,part_code,part_name,quantity,warehouse_comment,status,photo_file_id,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (unknown_number, user_id, user_name, part_code, part_name, quantity, warehouse_comment, UNKNOWN_STATUSES["waiting_andrey"], photo_file_id, now(), now()),
+        )
+        unknown_id = cur.lastrowid
+        conn.commit()
+    log_action("unknown_return", unknown_id, "Создана неопознанная б/у запчасть", "", UNKNOWN_STATUSES["waiting_andrey"], user_id, user_name)
+    return unknown_id
+
+
+def get_unknown_return(unknown_id: int) -> dict:
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM unknown_returns WHERE id=?", (unknown_id,)).fetchone()
+    if not row:
+        raise ValueError("Unknown return not found")
+    return row
 
 # =========================
 # FORMATTERS
 # =========================
 
-def fmt_items(items: List[sqlite3.Row]) -> str:
+def fmt_items(items: List[dict]) -> str:
     lines = []
     for idx, item in enumerate(items, 1):
         qty = item["quantity"] or "1"
@@ -474,7 +676,7 @@ def fmt_items(items: List[sqlite3.Row]) -> str:
     return "\n".join(lines)
 
 
-def fmt_return_items(items: List[sqlite3.Row]) -> str:
+def fmt_return_items(items: List[dict]) -> str:
     lines = []
     for idx, item in enumerate(items, 1):
         qty = item["quantity"] or "1"
@@ -553,32 +755,103 @@ def return_notification(return_id: int) -> str:
     return f"🔔 Обновление по возврату №{ret['return_number']}\n\n🚛 Авто: {ret['vehicle_plate']}\n📦 Запчасть: {part}\nСтатус: {ret['status']}"
 
 
+
+def unknown_return_card(unknown_id: int) -> str:
+    item = get_unknown_return(unknown_id)
+    base = (
+        f"⚠️ Неопознанная б/у запчасть №{item['unknown_number']}\n\n"
+        f"Артикул: {item['part_code']}\n"
+        f"Название: {item['part_name']}\n"
+        f"Количество: {item['quantity']}\n"
+        f"Комментарий склада: {item['warehouse_comment'] or '—'}\n\n"
+    )
+    if item.get("vehicle_plate") or item.get("recommendation"):
+        base += (
+            f"🚛 Госномер: {item.get('vehicle_plate') or '—'}\n"
+            f"📌 Решение Андрея: {item.get('recommendation') or '—'}\n\n"
+        )
+    base += f"Статус: {item['status']}"
+    return base
+
+
+def andrey_unknown_request_text(unknown_id: int) -> str:
+    item = get_unknown_return(unknown_id)
+    return (
+        "⚠️ Склад получил б/у запчасть без предварительного уведомления.\n\n"
+        f"Артикул: {item['part_code']}\n"
+        f"Название: {item['part_name']}\n"
+        f"Количество: {item['quantity']}\n"
+        f"Комментарий склада: {item['warehouse_comment'] or '—'}\n\n"
+        "Ответьте одним сообщением в 2 строки:\n\n"
+        "Госномер авто\n"
+        "Рекомендация\n\n"
+        "Пример:\n"
+        "АА1234ВС\n"
+        "На б/у склад\n\n"
+        "Рекомендация пишется в свободной форме.\n"
+        "Примеры:\n"
+        "В утиль\n"
+        "На восстановление\n"
+        "На б/у склад"
+    )
+
+
 # =========================
 # BACKUP
 # =========================
+
+BACKUP_TABLES = [
+    "users",
+    "orders",
+    "order_items",
+    "returns",
+    "return_items",
+    "unknown_returns",
+    "actions_log",
+    "pending_group_actions",
+    "app_settings",
+]
+
 
 def is_admin(user_id: int) -> bool:
     return bool(ADMIN_ID) and int(user_id) == int(ADMIN_ID)
 
 
-def make_sqlite_backup() -> str:
-    """
-    Создает корректную резервную копию SQLite через sqlite3 backup API.
-    Это безопаснее простого копирования файла во время работы бота.
-    """
+def export_database_json() -> str:
     init_db()
-    backup_name = f"bot_backup_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.db"
-    backup_path = f"/tmp/{backup_name}"
+    payload = {
+        "created_at": now(),
+        "format": "tkg_bot_supabase_json_backup",
+        "tables": {},
+    }
 
-    src = sqlite3.connect(DB_PATH)
-    dst = sqlite3.connect(backup_path)
-    try:
-        src.backup(dst)
-    finally:
-        dst.close()
-        src.close()
+    with get_db() as conn:
+        for table in BACKUP_TABLES:
+            rows = conn.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
+            payload["tables"][table] = [dict(row) for row in rows]
+
+    backup_name = f"tkg_backup_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.json"
+    backup_path = os.path.join(tempfile.gettempdir(), backup_name)
+
+    with open(backup_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
     return backup_path
+
+
+async def send_backup_file_by_bot(bot, chat_id: int, caption: str) -> None:
+    backup_path = None
+    try:
+        backup_path = export_database_json()
+        filename = os.path.basename(backup_path)
+        with open(backup_path, "rb") as f:
+            await bot.send_document(chat_id=chat_id, document=f, filename=filename, caption=caption)
+    finally:
+        if backup_path:
+            try:
+                os.remove(backup_path)
+            except Exception:
+                pass
 
 
 async def send_backup_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -590,30 +863,61 @@ async def send_backup_to_admin(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("⛔ У вас нет доступа к резервной копии.", reply_markup=MAIN_MENU)
         return
 
-    backup_path = None
     try:
-        backup_path = make_sqlite_backup()
-        filename = os.path.basename(backup_path)
-
-        with open(backup_path, "rb") as f:
-            await context.bot.send_document(
-                chat_id=user_id,
-                document=f,
-                filename=filename,
-                caption=(
-                    "💾 Резервная копия базы данных.\n\n"
-                    "Сохраните этот файл на компьютер или в облако.\n"
-                    "Внутри: заявки, статусы, ТТН, возвраты, история действий и photo_file_id."
-                ),
-            )
+        await send_backup_file_by_bot(
+            context.bot,
+            user_id,
+            (
+                "💾 Резервная копия базы Supabase/PostgreSQL.\n\n"
+                "Формат: JSON экспорт всех таблиц.\n"
+                "Сохраните файл на компьютер или в облако."
+            ),
+        )
     except Exception as e:
         await update.message.reply_text(f"❌ Не удалось создать резервную копию: {e}", reply_markup=MAIN_MENU)
-    finally:
-        if backup_path:
-            try:
-                os.remove(backup_path)
-            except Exception:
-                pass
+
+
+def daily_backup_is_due() -> Tuple[bool, str]:
+    current_dt = datetime.utcnow()
+    backup_key = current_dt.strftime("%Y-%m-%d")
+
+    if get_setting("last_daily_backup", "") == backup_key:
+        return False, backup_key
+
+    if current_dt.hour < DAILY_BACKUP_HOUR:
+        return False, backup_key
+
+    return True, backup_key
+
+
+async def maybe_send_daily_backup() -> None:
+    if not AUTO_DAILY_BACKUP or not ADMIN_ID:
+        return
+
+    is_due, backup_key = daily_backup_is_due()
+    if not is_due:
+        return
+
+    await send_backup_file_by_bot(
+        telegram_app.bot,
+        ADMIN_ID,
+        (
+            "💾 Автоматическая ежедневная резервная копия базы данных.\n\n"
+            f"Дата: {backup_key}\n"
+            "Сохраните файл на компьютер или в облако."
+        ),
+    )
+    set_setting("last_daily_backup", backup_key)
+
+
+async def daily_backup_loop() -> None:
+    await asyncio.sleep(10)
+    while True:
+        try:
+            await maybe_send_daily_backup()
+        except Exception:
+            pass
+        await asyncio.sleep(3600)
 
 
 async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -625,12 +929,47 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Ваш Telegram ID: {update.effective_user.id}", reply_markup=MAIN_MENU)
 
 
+async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user or not update.effective_chat:
+        return
+
+    if update.effective_chat.id != RETURNS_GROUP_ID:
+        await update.message.reply_text("Эта команда работает только в группе б/у ТКГ регионы.")
+        return
+
+    set_state(update.effective_user.id, "waiting_unknown_return", {"chat_id": update.effective_chat.id}, user_name_from_update(update))
+    await update.message.reply_text(
+        "Отправьте данные неопознанной б/у запчасти одним сообщением или фото с подписью.\n\n"
+        "Формат:\n"
+        "Артикул\n"
+        "Название\n"
+        "Количество\n\n"
+        "Пример:\n"
+        "123456\n"
+        "Стартер\n"
+        "1",
+        reply_markup=BU_GROUP_MENU,
+    )
+
+
 # =========================
 # TELEGRAM HANDLERS
 # =========================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+
+    chat = update.effective_chat
     set_state(update.effective_user.id, None, user_name=user_name_from_update(update))
+
+    if chat and chat.type in ("group", "supergroup") and chat.id == RETURNS_GROUP_ID:
+        await update.message.reply_text(
+            "Меню группы б/у ТКГ регионы:",
+            reply_markup=BU_GROUP_MENU,
+        )
+        return
+
     await update.message.reply_text(
         "Бот заявок на запчасти и возвраты б/у запчастей.\nВыберите действие:",
         reply_markup=MAIN_MENU,
@@ -649,7 +988,7 @@ async def text_or_photo_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     # Pending TTN from group
     if chat and chat.type in ("group", "supergroup"):
-        await handle_group_text(update, context, text)
+        await handle_group_text(update, context, text, photo_file_id)
         return
 
     # Main menu actions
@@ -692,6 +1031,22 @@ async def text_or_photo_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     state, data = get_state(user_id)
+
+    if state == "waiting_unknown_decision":
+        unknown_id = int(data["unknown_id"])
+        try:
+            plate, recommendation = parse_andrey_unknown_decision(text)
+        except ValueError as e:
+            await update.message.reply_text(
+                f"❌ {e}\n\nОтветьте в 2 строки, например:\nАА1234ВС\nНа б/у склад",
+                reply_markup=MAIN_MENU,
+            )
+            return
+
+        await resolve_unknown_return(context, unknown_id, plate, recommendation, user_id, user_name)
+        set_state(user_id, None, user_name=user_name)
+        await update.message.reply_text("✅ Решение сохранено и отправлено в группу б/у.", reply_markup=MAIN_MENU)
+        return
 
     if state == "waiting_order":
         try:
@@ -813,6 +1168,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user_id = update.effective_user.id
     user_name = user_name_from_update(update)
 
+    async def not_found_message() -> None:
+        if query.message:
+            await query.message.reply_text(
+                "⚠️ Заявка не найдена в базе. Возможно, она была создана до переноса базы или база была сброшена. Создайте новую заявку или восстановите данные из резервной копии."
+            )
+
     if data.startswith("dest:"):
         dest_key = data.split(":", 1)[1]
         state, state_data = get_state(user_id)
@@ -854,24 +1215,36 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if data.startswith("order_status:"):
         _, order_id_s, status_key = data.split(":")
-        await update_order_status(context, int(order_id_s), status_key, user_id, user_name)
-        await query.edit_message_text(order_card(int(order_id_s)), reply_markup=order_keyboard(int(order_id_s)))
+        try:
+            await update_order_status(context, int(order_id_s), status_key, user_id, user_name)
+            await query.edit_message_text(order_card(int(order_id_s)), reply_markup=order_keyboard(int(order_id_s)))
+        except ValueError:
+            await not_found_message()
         return
 
     if data.startswith("order_ttn:"):
         order_id = int(data.split(":")[1])
+        try:
+            order = get_order(order_id)
+        except ValueError:
+            await not_found_message()
+            return
         with get_db() as conn:
             conn.execute(
                 "INSERT INTO pending_group_actions(user_id,chat_id,action,entity_type,entity_id,created_at) VALUES(?,?,?,?,?,?)",
                 (user_id, query.message.chat_id, "awaiting_ttn", "order", order_id, now()),
             )
             conn.commit()
-        await query.message.reply_text(f"Введите номер ТТН Новой Почты для заявки №{get_order(order_id)['order_number']}:")
+        await query.message.reply_text(f"Введите номер ТТН Новой Почты для заявки №{order['order_number']}:")
         return
 
     if data.startswith("return_all:"):
         order_id = int(data.split(":")[1])
-        order = get_order(order_id)
+        try:
+            order = get_order(order_id)
+        except ValueError:
+            await not_found_message()
+            return
         order_items = get_order_items(order_id)
         items = [{"part_code": i["part_code"], "part_name": i["part_name"], "quantity": i["quantity"]} for i in order_items]
         return_id = create_return(
@@ -904,7 +1277,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if data.startswith("return_none:"):
         order_id = int(data.split(":")[1])
-        await query.message.reply_text(f"Готово. Заявка №{get_order(order_id)['order_number']} создана без возврата б/у.", reply_markup=MAIN_MENU)
+        try:
+            order = get_order(order_id)
+        except ValueError:
+            await not_found_message()
+            return
+        await query.message.reply_text(f"Готово. Заявка №{order['order_number']} создана без возврата б/у.", reply_markup=MAIN_MENU)
         return
 
     if data.startswith("return_status:"):
@@ -914,17 +1292,62 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
 
-async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, photo_file_id: Optional[str] = None) -> None:
     if not update.effective_user or not update.effective_chat or not text:
         return
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     user_name = user_name_from_update(update)
+
+    if chat_id == RETURNS_GROUP_ID and text.strip() == "⚠️ Неопознанная б/у запчасть":
+        set_state(user_id, "waiting_unknown_return", {"chat_id": chat_id}, user_name)
+        await update.message.reply_text(
+            "Отправьте данные неопознанной б/у запчасти одним сообщением или фото с подписью.\n\n"
+            "Формат:\n"
+            "Артикул\n"
+            "Название\n"
+            "Количество\n\n"
+            "Пример:\n"
+            "123456\n"
+            "Стартер\n"
+            "1",
+            reply_markup=BU_GROUP_MENU,
+        )
+        return
+
     with get_db() as conn:
         pending = conn.execute(
             "SELECT * FROM pending_group_actions WHERE user_id=? AND chat_id=? ORDER BY id DESC LIMIT 1",
             (user_id, chat_id),
         ).fetchone()
+    state, state_data = get_state(user_id)
+
+    if state == "waiting_unknown_return" and chat_id == RETURNS_GROUP_ID:
+        try:
+            part_code, part_name, quantity, warehouse_comment = parse_unknown_return_text(text)
+        except ValueError as e:
+            await update.message.reply_text(f"❌ {e}\n\nПример:\n123456\nСтартер\n1")
+            return
+
+        unknown_id = create_unknown_return(user_id, user_name, part_code, part_name, quantity, warehouse_comment, photo_file_id)
+        set_state(user_id, None, user_name=user_name)
+        await send_unknown_return_to_group_and_andrey(context, unknown_id)
+        await update.message.reply_text(f"✅ Неопознанная б/у запчасть №{get_unknown_return(unknown_id)['unknown_number']} создана.")
+        return
+
+    first_line = text.strip().splitlines()[0].lower().replace("ё", "е") if text.strip().splitlines() else ""
+    if chat_id == RETURNS_GROUP_ID and first_line in {"бу", "б/у", "+бу", "неопознанная", "неопознанная бу"}:
+        try:
+            part_code, part_name, quantity, warehouse_comment = parse_unknown_return_text(text)
+        except ValueError as e:
+            await update.message.reply_text(f"❌ {e}\n\nПример:\n+БУ\n123456\nСтартер\n1")
+            return
+
+        unknown_id = create_unknown_return(user_id, user_name, part_code, part_name, quantity, warehouse_comment, photo_file_id)
+        await send_unknown_return_to_group_and_andrey(context, unknown_id)
+        await update.message.reply_text(f"✅ Неопознанная б/у запчасть №{get_unknown_return(unknown_id)['unknown_number']} создана.")
+        return
+
     if not pending:
         return
 
@@ -1006,6 +1429,59 @@ async def send_return_to_group(context: ContextTypes.DEFAULT_TYPE, return_id: in
         conn.commit()
     if ret["photo_file_id"]:
         await context.bot.send_photo(RETURNS_GROUP_ID, ret["photo_file_id"], caption=f"Фото к возврату №{ret['return_number']}")
+
+
+
+async def send_unknown_return_to_group_and_andrey(context: ContextTypes.DEFAULT_TYPE, unknown_id: int) -> None:
+    item = get_unknown_return(unknown_id)
+
+    msg = await context.bot.send_message(RETURNS_GROUP_ID, unknown_return_card(unknown_id))
+    with get_db() as conn:
+        conn.execute("UPDATE unknown_returns SET group_message_id=? WHERE id=?", (msg.message_id, unknown_id))
+        conn.commit()
+
+    if item["photo_file_id"]:
+        await context.bot.send_photo(RETURNS_GROUP_ID, item["photo_file_id"], caption=f"Фото к неопознанной б/у №{item['unknown_number']}")
+
+    if ANDREY_ID:
+        try:
+            andrey_msg = await context.bot.send_message(ANDREY_ID, andrey_unknown_request_text(unknown_id))
+            with get_db() as conn:
+                conn.execute("UPDATE unknown_returns SET andrey_message_id=? WHERE id=?", (andrey_msg.message_id, unknown_id))
+                conn.commit()
+            set_state(ANDREY_ID, "waiting_unknown_decision", {"unknown_id": unknown_id}, "Андрей Авдеев")
+        except Exception:
+            await context.bot.send_message(
+                RETURNS_GROUP_ID,
+                f"⚠️ Не удалось отправить уведомление Андрею по №{item['unknown_number']}. Проверьте ANDREY_ID и чтобы Андрей написал /start боту."
+            )
+
+
+async def resolve_unknown_return(context: ContextTypes.DEFAULT_TYPE, unknown_id: int, vehicle_plate: str, recommendation: str, user_id: int, user_name: str) -> None:
+    item = get_unknown_return(unknown_id)
+    old_status = item["status"]
+    new_status = UNKNOWN_STATUSES["resolved"]
+
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE unknown_returns SET vehicle_plate=?, recommendation=?, status=?, updated_at=? WHERE id=?",
+            (vehicle_plate, recommendation, new_status, now(), unknown_id),
+        )
+        conn.commit()
+
+    log_action("unknown_return", unknown_id, "Решение Андрея", old_status, new_status, user_id, user_name)
+
+    updated = get_unknown_return(unknown_id)
+    if updated.get("group_message_id"):
+        try:
+            await context.bot.edit_message_text(
+                chat_id=RETURNS_GROUP_ID,
+                message_id=updated["group_message_id"],
+                text=unknown_return_card(unknown_id),
+            )
+        except Exception:
+            await context.bot.send_message(RETURNS_GROUP_ID, unknown_return_card(unknown_id))
+
 
 
 async def search_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, q: str) -> None:
@@ -1097,6 +1573,7 @@ def web_page(q: str = "", status: str = "") -> str:
         else:
             orders = conn.execute("SELECT * FROM orders ORDER BY id DESC LIMIT 300").fetchall()
             returns = conn.execute("SELECT * FROM returns ORDER BY id DESC LIMIT 300").fetchall()
+        unknowns = conn.execute("SELECT * FROM unknown_returns ORDER BY id DESC LIMIT 300").fetchall()
 
     order_rows = []
     for o in orders:
@@ -1121,6 +1598,16 @@ def web_page(q: str = "", status: str = "") -> str:
         <tr>
           <td>{esc(r['created_at'])}</td><td>{esc(r['return_number'])}</td><td>{esc(r['vehicle_plate'])}</td>
           <td>{esc(fmt_return_items(items))}</td><td>{esc(r['delivery_comment'])}</td><td>{esc(r['status'])}</td><td>{esc(linked)}</td>
+        </tr>
+        """)
+
+    unknown_rows = []
+    for u in unknowns:
+        unknown_rows.append(f"""
+        <tr>
+          <td>{esc(u['created_at'])}</td><td>{esc(u['unknown_number'])}</td><td>{esc(u['part_code'])}</td>
+          <td>{esc(u['part_name'])}</td><td>{esc(u['quantity'])}</td><td>{esc(u['vehicle_plate'])}</td>
+          <td>{esc(u['recommendation'])}</td><td>{esc(u['status'])}</td><td>{esc(u['created_by_user_name'])}</td>
         </tr>
         """)
 
@@ -1152,6 +1639,10 @@ def web_page(q: str = "", status: str = "") -> str:
     <h2>♻️ Возвраты б/у запчастей</h2>
     <table><thead><tr><th>Дата</th><th>№</th><th>Госномер</th><th>Запчасти</th><th>Доставка</th><th>Статус</th><th>Связь</th></tr></thead>
     <tbody>{''.join(return_rows) or '<tr><td colspan="7">Нет данных</td></tr>'}</tbody></table>
+
+    <h2>⚠️ Неопознанные б/у запчасти</h2>
+    <table><thead><tr><th>Дата</th><th>№</th><th>Артикул</th><th>Название</th><th>Кол-во</th><th>Госномер</th><th>Решение</th><th>Статус</th><th>Создал</th></tr></thead>
+    <tbody>{''.join(unknown_rows) or '<tr><td colspan="9">Нет данных</td></tr>'}</tbody></table>
     </body></html>
     """
 
@@ -1163,22 +1654,32 @@ telegram_app = Application.builder().token(BOT_TOKEN).build()
 telegram_app.add_handler(CommandHandler("start", cmd_start))
 telegram_app.add_handler(CommandHandler("backup", cmd_backup))
 telegram_app.add_handler(CommandHandler("id", cmd_id))
+telegram_app.add_handler(CommandHandler("unknown", cmd_unknown))
 telegram_app.add_handler(CallbackQueryHandler(callback_handler))
 telegram_app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, text_or_photo_handler))
 
 app = FastAPI()
+daily_backup_task = None
 
 @app.on_event("startup")
 async def on_startup() -> None:
+    global daily_backup_task
     init_db()
     await telegram_app.initialize()
     await telegram_app.start()
-    await telegram_app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook", drop_pending_updates=False)
+    await telegram_app.bot.set_webhook(
+        url=f"{WEBHOOK_URL}/webhook",
+        allowed_updates=["message", "callback_query"],
+        drop_pending_updates=False,
+    )
+    if daily_backup_task is None or daily_backup_task.done():
+        daily_backup_task = asyncio.create_task(daily_backup_loop())
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
-    # Важно: не удаляем webhook при остановке Render.
-    # Иначе Telegram получает url="" и бот перестает реагировать до ручной установки webhook.
+    global daily_backup_task
+    if daily_backup_task:
+        daily_backup_task.cancel()
     await telegram_app.stop()
     await telegram_app.shutdown()
 
